@@ -1,23 +1,22 @@
 import os, time, json, hmac, hashlib, base64, requests, math
 from urllib.parse import urlencode
 
-# ===== Settings from GitHub Secrets =====
+# ========= Settings from GitHub Secrets =========
 LIVE = os.getenv("LIVE", "false").lower() == "true"
 PAIRS = [p.strip().upper() for p in os.getenv("PAIRS", "BTCUSD,ETHUSD,ADAUSD,XRPUSD").split(",")]
-USD_PER_TRADE = float(os.getenv("USD_PER_TRADE", "20"))  # >=20 helps beat fees/ordermin
+USD_PER_TRADE = float(os.getenv("USD_PER_TRADE", "20"))  # target per trade
 API_KEY = os.getenv("KRAKEN_API_KEY", "")
 API_SECRET = os.getenv("KRAKEN_API_SECRET", "")
 
-# ===== Kraken HTTP =====
-BASE = "https://urldefense.com/v3/__https://api.kraken.com__;!!P7nkOOY!uwWbTD2KGUw6E-N7dKj2XwKvIq45B5yKJjG0xsES8f6gL_PwqCYVmaAyiPDCNfNH19gAs2fOxPnNR2DkKaDBF0WmfV_TSRcSfg$ "
+# ========= Kraken HTTP =========
+BASE = "https://urldefense.com/v3/__https://api.kraken.com__;!!P7nkOOY!rWsRS--PmlCUkVju37PVbWgfRhatjvB1EKEzvOm3nAcGf_5QmCdj4LDBev2xBR6gtWQfR6V2h9sMmbQaUUUTPMRR7Wkrxp23Qg$ "
 TIMEOUT = 20
 
 def http_get(path, params=None):
    r = requests.get(BASE + path, params=params or {}, timeout=TIMEOUT)
    r.raise_for_status()
    data = r.json()
-   if data.get("error"):
-       raise RuntimeError(data["error"])
+   if data.get("error"): raise RuntimeError(data["error"])
    return data["result"]
 
 def http_post_private(path, data):
@@ -32,25 +31,25 @@ def http_post_private(path, data):
    r = requests.post(BASE + path, headers=headers, data=data, timeout=TIMEOUT)
    r.raise_for_status()
    data = r.json()
-   if data.get("error"):
-       raise RuntimeError(data["error"])
+   if data.get("error"): raise RuntimeError(data["error"])
    return data["result"]
 
-# ===== Strategy (fast/aggressive) =====
+# ========= Strategy (aggressive, keeps capital moving) =========
 INTERVAL_MIN = 1
 EMA_FAST = 9
 EMA_SLOW = 21
 
 TAKE_PROFIT = 0.015      # +1.5%
 STOP_LOSS   = 0.005      # -0.5%
+TRAIL_ACTIVATE = 0.008   # trail starts after +0.8%
+TRAIL_PCT      = 0.004   # 0.4% trail
 
-TRAIL_ACTIVATE = 0.008   # start trailing after +0.8%
-TRAIL_PCT      = 0.004   # 0.4% trail after activation
-
-MAX_HOLD_MIN     = 20    # force exit after 20 minutes if flat
+MAX_HOLD_MIN     = 20    # force exit after 20 minutes
 SMALL_LOSS_EXIT  = 0.002 # allow -0.2% on timed exit
+RESERVE_USD      = 1.0   # keep a little USD for fees
+LOW_USD_FORCE    = 5.0   # if USD < this, force-sell stale positions to free funds
 
-# ===== Helpers =====
+# ========= Helpers =========
 def ema(series, period):
    k = 2/(period+1); vals=[]; prev=None
    for price in series:
@@ -65,7 +64,6 @@ def round_qty(qty, lot_decimals):
    q = 10 ** lot_decimals
    return math.floor(qty * q) / q
 
-# ----- Market data -----
 def resolve_pair(altname):
    res = http_get("/0/public/AssetPairs", {"pair": altname})
    key = list(res.keys())[0]
@@ -75,6 +73,7 @@ def resolve_pair(altname):
        "asset": d["base"],
        "lot_decimals": d.get("lot_decimals", 6),
        "ordermin": float(d.get("ordermin", "0.0001")),
+       "price_decimals": d.get("pair_decimals", 2),
    }
 
 def get_last_price(kpair):
@@ -87,38 +86,41 @@ def get_ohlc(kpair, interval=1, count=300):
    for kk, rows in res.items():
        if kk != "last":
            # rows: [time, open, high, low, close, vwap, volume, count]
-           return [[float(x) for x in row[:5]] for row in rows[-count:]]
+           rows = rows[-count:]
+           times  = [float(r[0]) for r in rows]
+           highs  = [float(r[2]) for r in rows]
+           closes = [float(r[4]) for r in rows]
+           return times, highs, closes
    raise RuntimeError("No OHLC data")
 
 def balances():
-   try:
-       return http_post_private("/0/private/Balance", {})
-   except:
-       return {}
+   try: return http_post_private("/0/private/Balance", {})
+   except: return {}
+
+def usd_balance_from(bals):
+   try: return float(bals.get("ZUSD") or bals.get("USD") or 0.0)
+   except: return 0.0
 
 def latest_trade(kpair, side=None):
    try:
        res = http_post_private("/0/private/TradesHistory", {"type": "all"})
        trades = list(res.get("trades", {}).values())
        trades = [t for t in trades if t.get("pair") == kpair]
-       if side:
-           trades = [t for t in trades if t.get("type") == side]
-       if not trades:
-           return (None, None, None, None)
+       if side: trades = [t for t in trades if t.get("type") == side]
+       if not trades: return (None, None, None, None)
        trades.sort(key=lambda t: t.get("time", 0), reverse=True)
        t = trades[0]
        return float(t["price"]), float(t["vol"]), float(t["time"]), t["type"]
    except:
        return (None, None, None, None)
 
-# ----- Instant-fill orders (taker) -----
+# ========= Orders (instant fills) =========
 def place_market(kpair, side, volume):
    payload = {"ordertype": "market", "type": side, "pair": kpair, "volume": str(volume)}
-   if LIVE:
-       return http_post_private("/0/private/AddOrder", payload)
+   if LIVE: return http_post_private("/0/private/AddOrder", payload)
    return {"simulated": True, "side": side, "pair": kpair, "volume": volume}
 
-# ----- Per-pair trade -----
+# ========= Trading per pair =========
 def trade_pair(alt_pair):
    try:
        meta = resolve_pair(alt_pair)
@@ -129,40 +131,45 @@ def trade_pair(alt_pair):
    lot_dec, ordermin = meta["lot_decimals"], meta["ordermin"]
 
    price = get_last_price(kpair)
-   ohlc = get_ohlc(kpair, interval=INTERVAL_MIN, count=max(EMA_SLOW+60, 240))
-   times  = [row[0] for row in ohlc]
-   highs  = [row[2] for row in ohlc]
-   closes = [row[4] for row in ohlc]
-
+   times, highs, closes = get_ohlc(kpair, interval=INTERVAL_MIN, count=max(EMA_SLOW+60, 240))
    ef, es = ema(closes, EMA_FAST), ema(closes, EMA_SLOW)
    f_now, s_now, f_prev, s_prev = ef[-1], es[-1], ef[-2], es[-2]
 
    bals = balances()
    hold = float(bals.get(asset, "0") or 0.0)
+   usd  = usd_balance_from(bals)
 
    last_any = latest_trade(kpair)
    last_buy, _, t_buy, _ = latest_trade(kpair, side="buy")
 
-   print(json.dumps({
-       "pair": alt_pair, "price": price,
-       "ema_fast": round(f_now, 6), "ema_slow": round(s_now, 6),
-       "hold": hold, "last_buy": last_buy
-   }))
+   print(json.dumps({"pair": alt_pair, "price": price, "hold": hold, "usd": usd,
+                     "ema_fast": round(f_now,6), "ema_slow": round(s_now,6),
+                     "last_buy": last_buy}))
 
-   # ENTRY — no position & bullish cross -> MARKET BUY (instant)
-   if hold < ordermin * 0.999 and bullish_cross(f_prev, s_prev, f_now, s_now):
-       usd = max(USD_PER_TRADE, 5)
-       vol = round_qty(max(usd / price, ordermin), lot_dec)
-       if vol >= ordermin:
-           res = place_market(kpair, "buy", vol)
-           print(f"[{alt_pair}] BUY {vol} @ market -> {res}")
+   # ----- FREE FUNDS if USD very low: liquidate stale positions (older than MAX_HOLD_MIN)
+   if usd < LOW_USD_FORCE and hold >= ordermin and t_buy and (time.time() - t_buy) >= MAX_HOLD_MIN*60:
+       vol = round_qty(hold, lot_dec)
+       res = place_market(kpair, "sell", vol)
+       print(f"[{alt_pair}] FORCE-SELL to free USD, {vol} @ market -> {res}")
        return
 
-   # EXIT — TP/SL/trailing/time/bearish
+   # ----- ENTRY: no position + bullish cross -> BUY using available USD
+   if hold < ordermin * 0.999 and bullish_cross(f_prev, s_prev, f_now, s_now):
+       budget = max(0.0, min(USD_PER_TRADE, usd - RESERVE_USD))
+       if budget >= price * ordermin:
+           vol = round_qty(max(budget / price, ordermin), lot_dec)
+           if vol >= ordermin:
+               res = place_market(kpair, "buy", vol)
+               print(f"[{alt_pair}] BUY {vol} @ market -> {res}")
+               return
+       print(f"[{alt_pair}] SKIP BUY (not enough USD) budget={budget:.4f}, need>={price*ordermin:.4f}")
+       return
+
+   # ----- EXIT: TP/SL/Trailing/Timed/Bearish
    sell_reason = None
    now = time.time()
 
-   # Trailing stop (since last buy)
+   # Trailing stop after activation
    if last_buy and t_buy:
        highs_since_buy = [h for (h, t) in zip(highs, times) if t >= t_buy]
        if highs_since_buy:
@@ -172,17 +179,15 @@ def trade_pair(alt_pair):
                if price <= trail_stop:
                    sell_reason = f"Trailing stop {TRAIL_PCT*100:.2f}%"
 
-   # Fixed target / stop
    if not sell_reason and last_buy:
        if price >= last_buy * (1 + TAKE_PROFIT): sell_reason = "TP"
        elif price <= last_buy * (1 - STOP_LOSS): sell_reason = "SL"
 
-   # Time-based exit
    if not sell_reason and last_buy and t_buy and (now - t_buy) >= MAX_HOLD_MIN * 60:
+       # Timed exit: get out even if flat / small loss to keep capital moving
        if price >= last_buy * (1 - SMALL_LOSS_EXIT):
            sell_reason = f"Timed exit {MAX_HOLD_MIN}m"
 
-   # Bearish cross safeguard
    if not sell_reason and bearish_cross(f_prev, s_prev, f_now, s_now):
        sell_reason = "Bearish cross"
 
@@ -193,6 +198,7 @@ def trade_pair(alt_pair):
    else:
        print(f"[{alt_pair}] no action")
 
+# ========= Main =========
 def main():
    if LIVE and (not API_KEY or not API_SECRET):
        raise RuntimeError("LIVE=True but API keys missing.")
