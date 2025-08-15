@@ -8,7 +8,7 @@ USD_PER_TRADE = float(os.getenv("USD_PER_TRADE", "10"))
 API_KEY = os.getenv("KRAKEN_API_KEY", "")
 API_SECRET = os.getenv("KRAKEN_API_SECRET", "")
 
-BASE = "https://urldefense.com/v3/__https://api.kraken.com__;!!P7nkOOY!tf2L1IomwwaYSMP4nSFO5dwpUYws6ULSVvY6tTumWbOvxbrXbwo-l6Ua2oRPsU7X8TzTykqr_USgVMrY1aTVdbh3jQ4sxpJW_w$ "
+BASE = "https://api.kraken.com"
 TIMEOUT = 20
 
 INTERVAL_MIN = 1
